@@ -19,7 +19,38 @@ console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
 logging.getLogger().addHandler(console_handler)
 
-def get_items_with_media(start_date, end_date, min_items=9):
+def should_include_item(item):
+    """Check if an item should be included in Discord notifications."""
+    try:
+        # Check description fields
+        description = item.get('dcterms:description', [])
+        if description and isinstance(description, list) and len(description) > 0:
+            desc_value = description[0].get('@value', '')
+            logging.debug(f"Found description: {desc_value[:100]}...")  # Log first 100 chars
+            if desc_value.startswith("More information to be added at a later date."):
+                logging.info(f"Excluding item {item.get('o:id', 'unknown')} due to placeholder description")
+                return False
+        
+        # Check alternative description fields
+        alt_fields = ['bibo:content', 'o:description']
+        for field in alt_fields:
+            desc = item.get(field, [])
+            if desc and isinstance(desc, list) and len(desc) > 0:
+                desc_value = desc[0].get('@value', '')
+                logging.debug(f"Found {field} description: {desc_value[:100]}...")  # Log first 100 chars
+                if desc_value.startswith("More information to be added at a later date."):
+                    logging.info(f"Excluding item {item.get('o:id', 'unknown')} due to placeholder {field}")
+                    return False
+        
+        # Log the raw description data for debugging
+        logging.debug(f"Raw item description data: {item.get('dcterms:description', [])}")
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error checking item description: {str(e)}")
+        return True  # Include item if there's an error checking description
+
+def get_items_with_media(start_datetime, end_datetime, enable_lookback=False, min_items=None):
     """Fetch items with media between dates from Omeka S API."""
     headers = {
         'Content-Type': 'application/json'
@@ -27,51 +58,67 @@ def get_items_with_media(start_date, end_date, min_items=9):
     
     url = f"{config.OMEKA_API_URL}/items"
     params = {
-        'created_after': start_date.isoformat(),
-        'created_before': end_date.isoformat(),
-        'has_media': '1'  # Filter for items with media
+        'created_after': start_datetime.isoformat(),
+        'created_before': end_datetime.isoformat(),
+        'has_media': '1'
     }
     
     try:
         response = requests.get(url, headers=headers, params=params)
         response.raise_for_status()
-        items = response.json()
+        all_items = response.json()
         
-        if items and len(items) >= min_items:
-            logging.info(f"Found {len(items)} items with media between {start_date} and {end_date}")
-            return items
+        # Filter out items with placeholder descriptions
+        if all_items:
+            items = [item for item in all_items if should_include_item(item)]
+            filtered_count = len(all_items) - len(items)
+            if filtered_count > 0:
+                logging.info(f"Filtered out {filtered_count} items with placeholder descriptions")
+        else:
+            items = []
         
-        # If we don't have enough items, look back one more day
-        thirty_days_ago = (datetime.now() - timedelta(days=30)).date()
-        if start_date > thirty_days_ago:  # Limit to 30 days lookback
-            logging.info(f"Only found {len(items) if items else 0} items, checking previous day")
-            new_end_date = start_date
-            new_start_date = start_date - timedelta(days=1)
-            previous_items = get_items_with_media(new_start_date, new_end_date, min_items)
+        # If lookback is enabled and we don't have enough items
+        if (enable_lookback and min_items and 
+            items and len(items) < min_items and 
+            start_datetime > (datetime.now() - timedelta(days=30))):
             
-            # Combine items from both periods
+            logging.info(f"Only found {len(items)} items, checking previous day (lookback enabled)")
+            new_end_datetime = start_datetime
+            new_start_datetime = start_datetime - timedelta(days=1)
+            previous_items = get_items_with_media(new_start_datetime, new_end_datetime, 
+                                                enable_lookback=True, 
+                                                min_items=min_items)
+            
             if previous_items:
                 items = (items or []) + previous_items
-            
+        
         return items
         
     except requests.exceptions.RequestException as e:
         logging.error(f"Error fetching items from Omeka S API: {str(e)}")
         return None
 
-def get_today_items():
-    """Fetch items added today from Omeka S API."""
-    # Ensure we're working with date objects consistently
-    today = datetime.now().date()
-    tomorrow = today + timedelta(days=1)
+def get_recent_items():
+    """Fetch items added in the last 24 hours."""
+    now = datetime.now()
+    twenty_four_hours_ago = now - timedelta(hours=24)
     
-    items = get_items_with_media(today, tomorrow)
+    items = get_items_with_media(
+        twenty_four_hours_ago, 
+        now,
+        enable_lookback=config.ENABLE_LOOKBACK,
+        min_items=config.LOOKBACK_MIN_ITEMS if config.ENABLE_LOOKBACK else None
+    )
     
     if not items:
-        logging.info("No items found for today")
+        logging.info("No new items found in the last 24 hours")
         return None
         
-    logging.info(f"Found total of {len(items)} items with media")
+    if config.ENABLE_LOOKBACK:
+        logging.info(f"Found total of {len(items)} items with media (lookback enabled)")
+    else:
+        logging.info(f"Found {len(items)} new items with media in the last 24 hours")
+    
     return items
 
 def log_new_items(items):
@@ -109,17 +156,10 @@ def get_item_thumbnail(item):
 
 async def main():
     """Main function to check for new items and send notifications."""
-    logging.info("Starting Omeka S daily check")
+    logging.info("Starting Omeka S check")
     
     try:
-        items = get_today_items()
-        if items is None:
-            logging.error("Failed to fetch items from Omeka S API")
-            return
-            
-        logging.info(f"Found {len(items) if items else 0} items")
-        log_new_items(items)
-        
+        items = get_recent_items()  # Changed from get_today_items()
         if items:
             logging.info("Initializing Discord notification")
             try:
@@ -132,14 +172,12 @@ async def main():
             except Exception as e:
                 logging.error(f"Discord notification failed: {str(e)}")
                 logging.error(f"Full traceback: {traceback.format_exc()}")
-        else:
-            logging.info("No items to send to Discord")
-            
+        
     except Exception as e:
         logging.error(f"Unexpected error in main: {str(e)}")
         logging.error(f"Full traceback: {traceback.format_exc()}")
     
-    logging.info("Completed Omeka S daily check")
+    logging.info("Completed Omeka S check")
 
 if __name__ == "__main__":
     asyncio.run(main()) 
