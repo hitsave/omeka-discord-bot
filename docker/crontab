@@ -1,0 +1,6 @@
+# Set PATH and other environment variables
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+SHELL=/bin/bash
+
+# Run the Omeka checker at 8 AM UTC every day
+0 8 * * * cd /app && python omeka_checker.py >> /app/logs/cron.log 2>&1 
